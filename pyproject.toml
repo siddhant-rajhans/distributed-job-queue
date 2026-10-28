@@ -1,0 +1,36 @@
+[project]
+name = "distributed-job-queue"
+version = "0.1.0"
+description = "Postgres-backed job queue with SKIP LOCKED, retries, backoff, dead-letter queue and crash recovery"
+requires-python = ">=3.11"
+authors = [{name = "Siddhant Rajhans", email = "sidjha88@gmail.com"}]
+license = {text = "MIT"}
+readme = "README.md"
+dependencies = [
+    "asyncpg>=0.29.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+    "click>=8.0.0",
+    "rich>=13.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "hypothesis>=6.0.0",
+]
+
+[project.scripts]
+jobqueue = "jobqueue.cli:cli"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
