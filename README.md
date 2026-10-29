@@ -1,63 +1,78 @@
 # Distributed Job Queue
 
+![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-316192?logo=postgresql&logoColor=white)
+![License: MIT](https://img.shields.io/badge/license-MIT-green)
+![Tests: 16 passing](https://img.shields.io/badge/tests-16%20passing-brightgreen)
+
 Postgres-backed distributed job queue using `SELECT ... FOR UPDATE SKIP LOCKED` for contention-free dequeuing, exponential backoff retries, dead-letter handling, worker heartbeats, and crash recovery.
 
 ## Measured Results
 
 | Metric | Value |
-|---|---|
-| Throughput (1 worker) | 276 jobs/s |
-| Throughput (4 workers) | 712 jobs/s |
-| Throughput (16 workers) | 822 jobs/s |
-| Jobs lost | 0 / 500 per run |
-| Double-processed | 0 |
-| Tests | 16/16 passing |
+|--------|-------|
+| Throughput (1 worker) | **276 jobs/s** |
+| Throughput (4 workers) | **712 jobs/s** |
+| Throughput (16 workers) | **822 jobs/s** |
+| Jobs lost | **0 / 500 per run** |
+| Double-processed | **0** |
+| Tests | **16/16 passing** |
 | Test categories | unit, concurrency, chaos, worker |
 
 ## Architecture
 
-```mermaid
-graph LR
-    subgraph Producers
-        P1[CLI / App] -->|enqueue| Q[(Postgres<br>jobs table)]
-    end
-    subgraph Workers
-        W1[Worker 1] -->|SKIP LOCKED dequeue| Q
-        W2[Worker 2] -->|SKIP LOCKED dequeue| Q
-        W3[Worker N] -->|SKIP LOCKED dequeue| Q
-    end
-    Q -->|heartbeat timeout| R[Reclaim]
-    R -->|requeue or dead-letter| Q
-    W1 -->|fail + backoff| Q
-    W1 -->|complete| Q
 ```
-
-## Design Decisions
-
-### 1. SKIP LOCKED over advisory locks
-
-`FOR UPDATE SKIP LOCKED` atomically claims a job row without blocking other workers. No external lock manager, no lock table bloat, no risk of lock leaks. The dequeue query updates `status = 'running'` in the same statement that acquires the lock, so there is no window between locking and claiming.
-
-### 2. Exponential backoff with dead-letter
-
-Failed jobs are requeued with exponential backoff (`base * 2^(attempt-1)`). After `max_retries` exhausted, jobs move to `dead` status instead of cycling forever. This prevents thundering-herd retries while ensuring persistent failures are surfaced and stop consuming worker cycles.
-
-### 3. Heartbeat-based crash recovery
-
-Each worker sends periodic heartbeats while processing a job. A reclaimer process scans for `running` jobs whose `last_heartbeat` exceeds the visibility timeout and requeues them (or dead-letters if retries are exhausted). This handles worker crashes, network partitions, and OOM kills without requiring external supervision.
-
-### 4. Priority + scheduled_at ordering
-
-The dequeue query orders by `priority DESC, scheduled_at ASC`, backed by a partial index on `status = 'queued'`. Higher priority jobs run first; within the same priority, FIFO ordering is preserved. The partial index keeps the dequeue path fast even with millions of completed rows in the table.
-
-### 5. Raw SQL over an ORM
-
-The queue uses raw `asyncpg` queries with hand-written SQL. The critical dequeue path is a single atomic UPDATE...RETURNING statement. An ORM would add abstraction over the exact locking and ordering semantics that define correctness here. The SQL is version-controlled and tested directly.
+                       ┌──────────────┐
+                       │   Producer   │
+                       │  (CLI / App) │
+                       └──────┬───────┘
+                              │
+                    enqueue(payload, priority)
+                              │
+                              ▼
+               ┌─────────────────────────────┐
+               │         PostgreSQL           │
+               │                              │
+               │   ┌──────────────────────┐   │
+               │   │     jobs table       │   │
+               │   │                      │   │
+               │   │  status:  queued     │   │
+               │   │  priority: 5         │   │
+               │   │  attempts: 0         │   │
+               │   │  max_retries: 3      │   │
+               │   │  last_heartbeat: ... │   │
+               │   └──────────────────────┘   │
+               │                              │
+               └───────────┬──────┬───────────┘
+                           │      │
+          SELECT ...       │      │     heartbeat
+          FOR UPDATE       │      │     timeout?
+          SKIP LOCKED      │      │
+              ┌────────────┘      └─────────────┐
+              ▼                                  ▼
+     ┌─────────────────┐                ┌──────────────┐
+     │    Worker 1     │                │   Reclaimer  │
+     │    Worker 2     │                │              │
+     │    Worker N     │                │  requeue or  │
+     └────────┬────────┘                │  dead-letter │
+              │                         └──────────────┘
+         ┌────┴─────┐
+         ▼          ▼
+      ✓ done     ✗ fail
+                    │
+              ┌─────┴──────┐
+              ▼            ▼
+        retry with     max retries
+        exp. backoff   exhausted
+              │            │
+              ▼            ▼
+         re-queued     ☠ dead-letter
+```
 
 ## API
 
 | Operation | Description |
-|---|---|
+|-----------|-------------|
 | `enqueue(payload, queue, priority, scheduled_at, max_retries)` | Add a job to the queue |
 | `dequeue(queue, worker_id)` | Claim the next job (SKIP LOCKED) |
 | `complete(job_id)` | Mark job as done |
@@ -144,13 +159,38 @@ asyncio.run(main())
 All settings use the `JQ_` environment variable prefix:
 
 | Variable | Default | Description |
-|---|---|---|
+|----------|---------|-------------|
 | `JQ_DATABASE_URL` | `postgresql://jobqueue:jobqueue@localhost:5432/jobqueue` | Postgres connection string |
 | `JQ_MAX_RETRIES` | 3 | Default max retries per job |
 | `JQ_BASE_BACKOFF_SECONDS` | 1.0 | Base delay for exponential backoff |
 | `JQ_VISIBILITY_TIMEOUT_SECONDS` | 30.0 | Heartbeat timeout before reclaim |
 | `JQ_HEARTBEAT_INTERVAL_SECONDS` | 10.0 | How often workers send heartbeats |
 | `JQ_POLL_INTERVAL_SECONDS` | 0.5 | Polling interval when queue is empty |
+
+<details>
+<summary><strong>Design Decisions</strong></summary>
+
+### 1. SKIP LOCKED over advisory locks
+
+`FOR UPDATE SKIP LOCKED` atomically claims a job row without blocking other workers. No external lock manager, no lock table bloat, no risk of lock leaks. The dequeue query updates `status = 'running'` in the same statement that acquires the lock, so there is no window between locking and claiming.
+
+### 2. Exponential backoff with dead-letter
+
+Failed jobs are requeued with exponential backoff (`base * 2^(attempt-1)`). After `max_retries` exhausted, jobs move to `dead` status instead of cycling forever. This prevents thundering-herd retries while ensuring persistent failures are surfaced and stop consuming worker cycles.
+
+### 3. Heartbeat-based crash recovery
+
+Each worker sends periodic heartbeats while processing a job. A reclaimer process scans for `running` jobs whose `last_heartbeat` exceeds the visibility timeout and requeues them (or dead-letters if retries are exhausted). This handles worker crashes, network partitions, and OOM kills without requiring external supervision.
+
+### 4. Priority + scheduled_at ordering
+
+The dequeue query orders by `priority DESC, scheduled_at ASC`, backed by a partial index on `status = 'queued'`. Higher priority jobs run first; within the same priority, FIFO ordering is preserved. The partial index keeps the dequeue path fast even with millions of completed rows in the table.
+
+### 5. Raw SQL over an ORM
+
+The queue uses raw `asyncpg` queries with hand-written SQL. The critical dequeue path is a single atomic UPDATE...RETURNING statement. An ORM would add abstraction over the exact locking and ordering semantics that define correctness here. The SQL is version-controlled and tested directly.
+
+</details>
 
 ## Schema
 
@@ -186,6 +226,25 @@ tests/test_queue.py       8 tests  enqueue, dequeue, priority, complete, fail, r
 tests/test_concurrency.py 2 tests  no double-processing (8 workers, 50 jobs), concurrent enqueue/dequeue
 tests/test_chaos.py       3 tests  crash recovery, max-retry dead-letter, random-failure chaos
 tests/test_worker.py      3 tests  job processing, retry with backoff, persistent failure dead-letter
+```
+
+## Project Structure
+
+```
+distributed-job-queue/
+├── src/jobqueue/
+│   ├── queue.py          SKIP LOCKED dequeue, enqueue, fail, complete
+│   ├── worker.py         Async worker loop with heartbeat + backoff
+│   ├── db.py             Connection pool + schema auto-creation
+│   └── cli.py            Click CLI (enqueue, stats, status, reclaim)
+├── tests/
+│   ├── test_queue.py     Core queue operations
+│   ├── test_concurrency.py  Multi-worker correctness
+│   ├── test_chaos.py     Crash recovery + random failure
+│   └── test_worker.py    Worker lifecycle + retry behavior
+├── docker-compose.yml
+├── Makefile              test, bench, lint, format
+└── pyproject.toml
 ```
 
 ## License
